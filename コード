@@ -1,0 +1,267 @@
+const SPREADSHEET_ID = '1Kw503dJcroxh77OeW9q0o4RKq_zuCRHlDIlDepd9jBc';
+const ROSTER_SHEET = '生徒マスタ';
+const RECORD_SHEET = '技テスト記録';
+const TEACHER_SHEET = '先生マスタ';
+const ADMIN_SHEET = '管理者マスタ';
+const AUDIT_SHEET = '操作履歴';
+const CHANGE_SHEET = '変更申請';
+
+const RECORD_HEADERS = ['記録ID','実施日','生徒ID','共通会員ID','氏名','ふりがな','学年','性別','校舎ID','教室表示名','クラス','班','種目','技・評価項目','評価','先生メモ','担当先生','登録日時','更新日時','技テスト内部先生ID','入力者先生ID','入力者表示名','入力者区分'];
+const TEACHER_HEADERS = ['先生ID','共通先生ID','氏名','呼ばれ方','電話番号','申請区分','所属','担当クラス','その他登録情報','状態','申請日時','承認日時','承認者ID','承認者名','登録日時','更新日時'];
+const ADMIN_HEADERS = ['管理者ID','氏名','表示名','電話番号','権限','状態','申請日時','承認日時','承認者ID','承認者名','登録日時','更新日時'];
+const AUDIT_HEADERS = ['履歴ID','日時','操作','実行者ID','実行者名','区分・権限','対象ID','対象名','詳細'];
+const CHANGE_HEADERS = ['変更申請ID','申請者区分','申請者ID','申請者名','変更前','変更後','状態','申請日時','確認日時','承認者ID','承認者名','更新日時'];
+const STUDENT_LINK_HEADERS = ['共通会員ID','学年','性別','校舎ID','教室表示名','在籍状態','更新日時'];
+
+function doGet(e) {
+  if ((e.parameter.action || '') !== 'roster') return json_({ students: [] });
+  const sheet = SpreadsheetApp.openById(SPREADSHEET_ID).getSheetByName(ROSTER_SHEET);
+  if (!sheet || sheet.getLastRow() < 2 || sheet.getLastColumn() < 1) return json_({ students: [] });
+  const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getDisplayValues()[0].map(String);
+  const rows = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn()).getValues();
+  const at = function(row, names, fallback) {
+    const index = names.map(function(name) { return headers.indexOf(name); }).find(function(value) { return value >= 0; });
+    return index >= 0 ? row[index] : row[fallback];
+  };
+  const students = rows.filter(function(row) { return at(row, ['生徒ID','技テスト内部ID','会員ID','ID'], 0); }).map(function(row) {
+    return {
+      id: String(at(row, ['生徒ID','技テスト内部ID','会員ID','ID'], 0) || ''),
+      commonMemberId: String(at(row, ['共通会員ID','共通ID'], -1) || ''),
+      name: String(at(row, ['氏名','名前'], 1) || ''),
+      kana: String(at(row, ['ふりがな','フリガナ'], 2) || ''),
+      grade: String(at(row, ['学年'], -1) || ''),
+      gender: normalizeGender_(at(row, ['性別'], -1)),
+      classroomId: String(at(row, ['校舎ID','教室ID'], -1) || ''),
+      classroomName: String(at(row, ['教室表示名','校舎名','教室名'], -1) || ''),
+      className: String(at(row, ['クラス','クラス名'], 3) || ''),
+      groupName: String(at(row, ['登録班','班'], 4) || '未設定'),
+      enrollmentStatus: normalizeEnrollmentStatus_(at(row, ['在籍状態','状態'], 5)),
+      updatedAt: String(at(row, ['更新日時'], -1) || ''),
+      birthDate: formatDateValue_(at(row, ['生年月日'], -1)),
+      age: Number(at(row, ['年齢'], -1)) || ''
+    };
+  });
+  return json_({ students: students });
+}
+
+function doPost(e) {
+  const body = JSON.parse(e.postData.contents || '{}');
+  if (body.action === 'upsertTeacher' && body.teacher) return upsertTeacher_(body.teacher);
+  if (body.action === 'upsertAdmin' && body.admin) return upsertAdmin_(body.admin);
+  if (body.action === 'appendAudit' && body.event) return appendAudit_(body.event);
+  if (body.action === 'upsertChangeRequest' && body.request) return upsertChangeRequest_(body.request);
+  if (body.action === 'upsertStudent' && body.student) return upsertStudent_(body.student);
+  if (body.action === 'promoteGuest' && body.student) return promoteGuest_(body.student);
+  if (body.action === 'deleteAssessment' && body.recordId) return deleteAssessment_(body.recordId);
+  if (body.action !== 'appendAssessments' || !Array.isArray(body.records)) return json_({ ok: false });
+  const sheet = getOrCreateSheet_(RECORD_SHEET);
+  const headerMap = ensureHeaders_(sheet, RECORD_HEADERS);
+  body.records.forEach(function(record) {
+    const recordId = String(record.recordId || record.id || '');
+    const rowNumber = findRowByHeaderValue_(sheet, headerMap, '記録ID', recordId) || sheet.getLastRow() + 1;
+    writeObjectRow_(sheet, headerMap, rowNumber, {
+      '記録ID': recordId, '実施日': record.testDate, '生徒ID': record.studentId, '共通会員ID': record.memberId,
+      '氏名': record.studentName, 'ふりがな': record.studentKana, '学年': record.grade, '性別': record.gender,
+      '校舎ID': record.classroomId, '教室表示名': record.classroomName, 'クラス': record.className, '班': record.groupName,
+      '種目': record.category, '技・評価項目': record.skill, '評価': record.score, '先生メモ': record.note,
+      '担当先生': record.teacherName, '登録日時': record.createdAt, '更新日時': record.updatedAt,
+      '技テスト内部先生ID': record.actorInternalTeacherId, '入力者先生ID': record.actorTeacherId,
+      '入力者表示名': record.actorDisplayName, '入力者区分': record.actorStatus
+    });
+  });
+  return json_({ ok: true, count: body.records.length });
+}
+
+function upsertStudent_(student) {
+  const sheet = SpreadsheetApp.openById(SPREADSHEET_ID).getSheetByName(ROSTER_SHEET);
+  if (!sheet || sheet.getLastRow() < 2) return json_({ ok: false, error: 'student sheet not found' });
+  const headerMap = ensureHeaders_(sheet, STUDENT_LINK_HEADERS);
+  ensureStudentGenderValidation_(sheet, headerMap);
+  const idHeader = ['生徒ID','技テスト内部ID','会員ID','ID'].find(function(header) { return Boolean(headerMap[header]); });
+  if (!idHeader) return json_({ ok: false, error: 'student id header not found' });
+  const rowNumber = findRowByHeaderValue_(sheet, headerMap, idHeader, student.studentId);
+  if (!rowNumber) return json_({ ok: true, updated: false });
+  writeObjectRow_(sheet, headerMap, rowNumber, {
+    '共通会員ID': student.commonMemberId, '学年': student.grade, '性別': student.gender,
+    '校舎ID': student.classroomId, '教室表示名': student.classroomName,
+    '在籍状態': student.enrollmentStatus, '更新日時': student.updatedAt
+  });
+  return json_({ ok: true, updated: true, row: rowNumber });
+}
+
+/**
+ * 明示的な初期設定用。読み取り処理からは呼ばず、既存列を維持したまま
+ * 不足している「性別」列だけを末尾へ追加し、男・女・その他の選択規則を設定する。
+ */
+function setupStudentRosterSchema() {
+  const sheet = SpreadsheetApp.openById(SPREADSHEET_ID).getSheetByName(ROSTER_SHEET);
+  if (!sheet) throw new Error('生徒マスタが見つかりません');
+  const headerMap = ensureHeaders_(sheet, ['性別', '生年月日']);
+  ensureStudentGenderValidation_(sheet, headerMap);
+  return { ok: true, sheet: ROSTER_SHEET, genderColumn: headerMap['性別'] };
+}
+
+function promoteGuest_(student) {
+  const sheet = SpreadsheetApp.openById(SPREADSHEET_ID).getSheetByName(ROSTER_SHEET);
+  if (!sheet) return json_({ ok: false, error: 'student sheet not found' });
+  const headerMap = ensureHeaders_(sheet, ['性別', '共通会員ID', '生年月日']);
+  ensureStudentGenderValidation_(sheet, headerMap);
+  const marker = 'ゲスト移行元:' + String(student.id || '');
+  const existingByMarker = findRowByHeaderValue_(sheet, headerMap, '備考', marker);
+  if (existingByMarker) return json_({ ok: true, duplicate: true, row: existingByMarker });
+  const ids = headerMap['共通会員ID'] && sheet.getLastRow() >= 2 ? sheet.getRange(2, headerMap['共通会員ID'], sheet.getLastRow() - 1, 1).getDisplayValues() : [];
+  const maxId = ids.reduce(function(max, row) { const match = String(row[0] || '').match(/^iC(\d{3})$/); return match ? Math.max(max, Number(match[1])) : max; }, 0);
+  if (maxId >= 999) return json_({ ok: false, error: 'common id limit' });
+  const commonId = 'iC' + String(maxId + 1).padStart(3, '0');
+  const internalId = 'G-' + Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyyMMdd') + '-' + String(maxId + 1).padStart(3, '0');
+  const rowNumber = sheet.getLastRow() + 1;
+  writeObjectRow_(sheet, headerMap, rowNumber, {
+    '生徒ID': internalId, '共通会員ID': commonId, '氏名': String(student.name || ''), 'ふりがな': String(student.kana || ''),
+    'クラス': String(student.className || ''), '班': '', '在籍状態': '在籍', '登録日': new Date(), '備考': marker,
+    '性別': normalizeGender_(student.gender), '生年月日': String(student.birthDate || '')
+  });
+  return json_({ ok: true, row: rowNumber, commonMemberId: commonId, studentId: internalId });
+}
+
+function ensureStudentGenderValidation_(sheet, headerMap) {
+  const column = headerMap['性別'];
+  if (!column) return;
+  const rowCount = Math.max(sheet.getMaxRows() - 1, 1);
+  const rule = SpreadsheetApp.newDataValidation()
+    .requireValueInList(['男', '女', 'その他'], true)
+    .setAllowInvalid(false)
+    .setHelpText('男・女・その他から選択してください')
+    .build();
+  sheet.getRange(2, column, rowCount, 1).setDataValidation(rule);
+}
+
+function deleteAssessment_(recordId) {
+  const sheet = SpreadsheetApp.openById(SPREADSHEET_ID).getSheetByName(RECORD_SHEET);
+  if (!sheet || sheet.getLastRow() < 2) return json_({ ok: true, deleted: false });
+  const headerMap = ensureHeaders_(sheet, RECORD_HEADERS);
+  const rowNumber = findRowByHeaderValue_(sheet, headerMap, '記録ID', recordId);
+  if (rowNumber) sheet.deleteRow(rowNumber);
+  return json_({ ok: true, deleted: Boolean(rowNumber) });
+}
+
+function upsertTeacher_(teacher) {
+  const sheet = getOrCreateSheet_(TEACHER_SHEET);
+  const headerMap = ensureHeaders_(sheet, TEACHER_HEADERS);
+  const rowNumber = findRowByHeaderValue_(sheet, headerMap, '先生ID', teacher.publicId) || sheet.getLastRow() + 1;
+  writeObjectRow_(sheet, headerMap, rowNumber, {
+    '先生ID': teacher.publicId, '共通先生ID': teacher.commonTeacherId, '氏名': teacher.fullName,
+    '呼ばれ方': teacher.displayName, '電話番号': teacher.phone, '申請区分': teacher.accountType,
+    '所属': teacher.affiliation, '担当クラス': teacher.assignedClasses, 'その他登録情報': teacher.extraInfo,
+    '状態': teacherStatusLabel_(teacher.status), '申請日時': teacher.requestedAt, '承認日時': teacher.approvedAt,
+    '承認者ID': teacher.approvedById, '承認者名': teacher.approvedByName,
+    '登録日時': teacher.createdAt, '更新日時': teacher.updatedAt
+  });
+  return json_({ ok: true, row: rowNumber });
+}
+
+function upsertAdmin_(admin) {
+  const sheet = getOrCreateSheet_(ADMIN_SHEET);
+  const headerMap = ensureHeaders_(sheet, ADMIN_HEADERS);
+  const rowNumber = findRowByHeaderValue_(sheet, headerMap, '管理者ID', admin.publicId) || sheet.getLastRow() + 1;
+  writeObjectRow_(sheet, headerMap, rowNumber, {
+    '管理者ID': admin.publicId, '氏名': admin.fullName, '表示名': admin.displayName, '電話番号': admin.phone,
+    '権限': admin.role, '状態': admin.status, '申請日時': admin.requestedAt, '承認日時': admin.approvedAt,
+    '承認者ID': admin.approvedById, '承認者名': admin.approvedByName, '登録日時': admin.createdAt, '更新日時': admin.updatedAt
+  });
+  return json_({ ok: true, row: rowNumber });
+}
+
+function appendAudit_(event) {
+  const sheet = getOrCreateSheet_(AUDIT_SHEET);
+  const headerMap = ensureHeaders_(sheet, AUDIT_HEADERS);
+  const rowNumber = findRowByHeaderValue_(sheet, headerMap, '履歴ID', event.eventId) || sheet.getLastRow() + 1;
+  writeObjectRow_(sheet, headerMap, rowNumber, {
+    '履歴ID': event.eventId, '日時': event.occurredAt, '操作': auditActionLabel_(event.action),
+    '実行者ID': event.actorId, '実行者名': event.actorName, '区分・権限': event.actorRole,
+    '対象ID': event.targetId, '対象名': event.targetName, '詳細': event.details
+  });
+  return json_({ ok: true, row: rowNumber });
+}
+
+function upsertChangeRequest_(request) {
+  const sheet = getOrCreateSheet_(CHANGE_SHEET);
+  const headerMap = ensureHeaders_(sheet, CHANGE_HEADERS);
+  const rowNumber = findRowByHeaderValue_(sheet, headerMap, '変更申請ID', request.requestId) || sheet.getLastRow() + 1;
+  writeObjectRow_(sheet, headerMap, rowNumber, {
+    '変更申請ID': request.requestId, '申請者区分': request.requesterType, '申請者ID': request.requesterId,
+    '申請者名': request.requesterName, '変更前': request.currentData, '変更後': request.requestedData,
+    '状態': request.status, '申請日時': request.requestedAt, '確認日時': request.reviewedAt,
+    '承認者ID': request.reviewerId, '承認者名': request.reviewerName, '更新日時': request.updatedAt
+  });
+  return json_({ ok: true, row: rowNumber });
+}
+
+function getOrCreateSheet_(name) {
+  const book = SpreadsheetApp.openById(SPREADSHEET_ID);
+  return book.getSheetByName(name) || book.insertSheet(name);
+}
+
+function ensureHeaders_(sheet, headers) {
+  const lastColumn = Math.max(sheet.getLastColumn(), 1);
+  const existing = sheet.getLastRow() > 0 ? sheet.getRange(1, 1, 1, lastColumn).getDisplayValues()[0].map(String) : [];
+  const missing = headers.filter(function(header) { return existing.indexOf(header) < 0; });
+  if (missing.length) {
+    const start = existing.length + 1;
+    if (sheet.getMaxColumns() < start + missing.length - 1) sheet.insertColumnsAfter(sheet.getMaxColumns(), start + missing.length - 1 - sheet.getMaxColumns());
+    sheet.getRange(1, start, 1, missing.length).setValues([missing]);
+  }
+  const finalHeaders = existing.concat(missing);
+  return finalHeaders.reduce(function(map, header, index) { if (header) map[header] = index + 1; return map; }, {});
+}
+
+function writeObjectRow_(sheet, headerMap, rowNumber, values) {
+  Object.keys(values).forEach(function(header) {
+    if (headerMap[header]) sheet.getRange(rowNumber, headerMap[header]).setValue(values[header] == null ? '' : values[header]);
+  });
+}
+
+function findRowByHeaderValue_(sheet, headerMap, header, value) {
+  if (!value || !headerMap[header] || sheet.getLastRow() < 2) return 0;
+  const values = sheet.getRange(2, headerMap[header], sheet.getLastRow() - 1, 1).getDisplayValues();
+  const index = values.findIndex(function(row) { return String(row[0]) === String(value); });
+  return index >= 0 ? index + 2 : 0;
+}
+
+function normalizeGender_(value) {
+  const text = String(value || '').trim();
+  return text === '男' || text === '女' || text === 'その他' ? text : '';
+}
+
+function formatDateValue_(value) {
+  if (!value) return '';
+  if (Object.prototype.toString.call(value) === '[object Date]' && !isNaN(value.getTime())) return Utilities.formatDate(value, 'Asia/Tokyo', 'yyyy-MM-dd');
+  const text = String(value).trim().replace(/\//g, '-');
+  return /^\d{4}-\d{1,2}-\d{1,2}$/.test(text) ? text.split('-').map(function(part, index) { return index === 0 ? part : String(Number(part)).padStart(2, '0'); }).join('-') : '';
+}
+
+function normalizeEnrollmentStatus_(value) {
+  const text = String(value || '').trim();
+  return text === '休会' ? '休会' : text === '退会' ? '退会' : '在籍';
+}
+
+function teacherStatusLabel_(status) {
+  return status === 'pending' ? '承認待ち' : status === 'approved' ? '承認' : status === 'held' ? '保留' : status === 'rejected' ? '却下' : status === 'disabled' ? '利用停止' : 'ゲスト';
+}
+
+function auditActionLabel_(action) {
+  const labels = {
+    guest_registered: 'ゲスト登録', guest_applied: 'ゲスト申請', teacher_applied: '先生登録申請',
+    teacher_approved: '先生承認', teacher_held: '先生保留', teacher_rejected: '先生却下',
+    teacher_disabled: '先生利用停止', teacher_activated: '先生利用再開', admin_applied: '管理者登録申請',
+    admin_registered: '管理者登録', admin_profile_updated: '管理者情報更新', admin_approve: '管理者承認',
+    admin_hold: '管理者保留', admin_reject: '管理者却下', admin_disable: '管理者利用停止', admin_activate: '管理者利用再開',
+    profile_change_applied: '登録情報変更申請', profile_change_approve: '変更申請承認',
+    profile_change_hold: '変更申請保留', profile_change_reject: '変更申請却下', assessment_saved: '評価保存',
+    app_config_updated: '設定・名簿変更', login_requirement_changed: 'ログイン必須設定変更', assessment_deleted: '評価削除'
+  };
+  return labels[action] || String(action || '操作');
+}
+
+function json_(value) {
+  return ContentService.createTextOutput(JSON.stringify(value)).setMimeType(ContentService.MimeType.JSON);
+}
